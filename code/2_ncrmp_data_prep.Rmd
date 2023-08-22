@@ -1,0 +1,533 @@
+---
+title: "2. National Coral Reef Monitoring Program (NCRMP) Data Processing"
+author: "Sara Devi Swaminathan"
+date: "`r Sys.Date()`"
+output: html_document
+toc: true
+toc_float: true
+number_sections: true
+---
+
+# I. Background information
+## Install Packages and set working directory
+
+- This script compiles the National Coral Reef Monitoring 
+Program (NCRMP) coral and fish data for use in modeling the projected impacts 
+of SCTLD on reef fish communities in Florida and the Caribbean. 
+
+- Sampling design - SE Florida, Dry Tortugas, and Keys are sampled in even-numbered years. Puerto Rico and USVI are sampled in odd-numbered years, with the exception that Puerto Rico was sampled in 2016 and 2019. Typically, fish and coral are sampled at the same time in the Caribbean and separately in Florida. In Florida, until 2018, there were two teams of two divers within the Primary Sampling Unit (this makes it 2 stage). In the Caribbean, and Florida beginning in 2020, there is just one team of two divers.
+
+1. Caribbean (2018) Sampling Design: 
+<https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Caribbean_Gulf-of-Mexico/NCRMP_Protocol_SampleFrame%20Protocol_2016.pdf>
+-  Helpful information on sampling design for Florida: 
+<https://floridadep.gov/sites/default/files/SEFCRI_FIA_5_Year_Summary_%20Report-FINAL_1.pdf>
+## Survey protocols
+1. Coral demographics Survey Protocol for Atlantic, U.S. Caribbean, and Gulf of 
+Mexico (2016): 
+<https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Caribbean_Gulf-of-Mexico/NCRMP_Protocol_Benthic_CoralDemographic_2016.pdf>
+  - for Florida (2017): 
+<https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Florida/NCRMP_Coral_Demographic_Protocol_09062017.pdf>
+2. Line Point-Intercept (LPI) Survey Protocol for Atlantic, U.S. Caribbean, and
+Gulf of Mexico: 
+<https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Caribbean_Gulf-of-Mexico/NCRMP_Protocol_Benthic_LinePointIntercept_2016.pdf>
+  - for Florida (2017): 
+  <https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Florida/NCRMP_Benthic_Assessment_Protocol_09062017.pdf>  
+3. Reef Visual Census (RVC) Survey Protocol for Atlantic, U.S. Caribbean, and
+Gulf of Mexico: 
+<https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Caribbean_Gulf-of-Mexico/NCRMP_Protocol_Fish_RVC_2016.pdf>
+  - for Florida (2017): 
+  <https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Florida/NCRMP_RVC_Protocol_2017.pdf>
+4. Topographic Complexity Survey Protocol for Atlantic, U.S. Caribbean, and
+Flower Garden Banks: 
+<https://www.nodc.noaa.gov/archive/arc0101/0157633/7.7/data/0-data/Atlantic/Biological/Caribbean_Gulf-of-Mexico/NCRMP_Protocol_Benthic_TopographicComplexity_2016.pdf>
+
+~~~ 
+
+# II. Data processing and geospatial merge
+## Install Packages and set working directory
+
+```{r setup, include = FALSE, cache = FALSE}
+#install.packages('devtools')
+#devtools::install_github('jeremiaheb/rvc')
+library(rvc)
+#to install the package, download clone from github (https://github.com/shgroves/NCRMP_benthics) and devtools::install() from ncrmp.benthics.analysis (not NCRMP_benthics) project. Then you can load the library from any project
+library(ncrmp.benthics.analysis)
+library(knitr)
+library(tidyverse)
+library(vegan)
+library(geosphere)
+library(data.table)
+library(lubridate)
+library(readxl)
+
+## this sets the markdown working directory to the project folder
+
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) 
+```
+
+## Download fish data from RVC database in long format from 2016-2021
+
+```{r}
+## Download desired Years/Regions of RVC (NCRMP) fish data from server
+allRvc16_21 = getRvcData(years = 2016:2021, regions = c("FLA KEYS", "DRY TORT", "STX", "STTSTJ","PRICO", "SEFCRI"))
+
+#extract sample_data from list - each observation is a row (even null observations)
+ncrmpFish <- allRvc16_21$sample_data %>%
+  mutate(SampleID=paste(MAPGRID_NR, YEAR, sep = "-"), #unique ID column called SampleID
+     date=ymd(paste(YEAR, MONTH, DAY, sep="-")), #date
+     surveytype="fish") %>%
+  relocate(SampleID, .before = "PRIMARY_SAMPLE_UNIT") %>% 
+  filter(!SampleID == "379048-2019")%>% #issue#3 explained later
+  filter(!SampleID %in% c("1975761-2016","1966358-2016","1926932-2016","1811333-2016","1804147-2016","1812230-2016","1798011-2016","1815963-2016","985741-2016","1112984-2016","929947-2016","1888013-2018", "1063027-2018","319746-2021","456853-2021","408212-2021","482688-2021","576045-2021","495279-2021","607819-2021","566772-2021","623914-2021","602895-2021","265062-2021", "1178410-2021")) #Issue #4, explained below
+
+#Issue #2 explained below: rename this specific sampleID because there were two visits to this Mapgrid# in the same year that were far apart
+ncrmpFish$SampleID[ncrmpFish$SampleID =="308716-2019" & ncrmpFish$date == "2019-06-04"]<-"308716-2019_2"
+
+#Issue #1 explained below - fish longitude typo in fish data
+ncrmpFish$LON_DEGREES[ncrmpFish$SampleID =="791405-2021" & ncrmpFish$date == "2021-08-06"]<- -65.07960
+
+### USE THE DOWNLOADED DATA IF HAVING TROUBLE WITH THE rvc PACKAGE
+write.csv(ncrmpFish, "data/outputs/ncrmpFish.csv")
+#ncrmpFish <- read_csv( "data/ncrmpFish.csv")
+```
+
+## Read in coral demography data from NCRMP Benthics package
+
+```{r}
+#Bind all coral datasets into one
+coralList<-list(USVI_2021_coral_demographics,
+USVI_2019_coral_demographics,
+USVI_2017_coral_demographics,
+USVI_2015_coral_demographics,
+Tortugas_2020_coral_demographics,
+Tortugas_2018_coral_demographics,
+TortugasMarq_2016_coral_demographics,
+SEFCRI_2020_coral_demographics,
+SEFCRI_2018_coral_demographics,
+SEFCRI_2016_coral_demographics,
+PRICO_2021_coral_demographics,
+PRICO_2019_coral_demographics,
+PRICO_2016_coral_demographics,
+FLK_2020_coral_demographics,
+FLK_2018_coral_demographics,
+FLK_2016_coral_demographics)
+
+#convert list to dataframe and add standardizing columns
+ncrmpCoral<-setDT(Reduce(function(x, y) merge(x, y, all=TRUE), coralList) %>%
+  mutate(SampleID=paste(MAPGRID_NR,YEAR,sep="-"), #unique ID column
+   latlong = paste(LAT_DEGREES, LON_DEGREES),  #GPS coords
+   date = ymd(paste(YEAR, MONTH, DAY, sep="-")),
+   surveytype = "coral"))%>%
+  filter(!SampleID == "379048-2019") %>% #issue #3 explained later
+  filter(!SampleID %in% c("1975761-2016","1966358-2016","1926932-2016","1811333-2016","1804147-2016","1812230-2016","1798011-2016","1815963-2016","985741-2016","1112984-2016","929947-2016","1888013-2018", "1063027-2018","319746-2021","456853-2021","408212-2021","482688-2021","576045-2021","495279-2021","607819-2021","566772-2021","623914-2021","602895-2021","265062-2021", "1178410-2021")) #Issue #4, justified later
+
+#Issue #2 explained later: rename this specific sampleID because there were two visits to this Mapgrid# in the same year that were far apart(proof later)
+ncrmpCoral$SampleID[ncrmpCoral$SampleID =="308716-2019" & ncrmpCoral$date == "2019-06-04"]<-"308716-2019_2"
+
+### USE THE DOWNLOADED DATA IF HAVING TROUBLE WITH THE BENTHICS PACKAGE
+write.csv(ncrmpCoral, "data/outputs/ncrmpCoral.csv")
+#ncrmpCoral <- read_csv( "data/ncrmpCoral.csv")
+
+#subset to only data that overlaps with fish
+ncrmpCoralInFish <-ncrmpCoral %>%
+   filter(SampleID %in% ncrmpFish$SampleID) #select overlapping with fish
+
+# Make a summary table, selecting only metadata and SampleIDs that overlap with fish data (n = 1732)
+ncrmpCoralInFishSummary<- ncrmpCoralInFish %>%
+                            dplyr::select(SampleID, LAT_DEGREES, REGION, LON_DEGREES, date, YEAR, surveytype) %>% #select metadata
+                            unique()  #remove repeated rows (still in long format)
+
+```
+
+## Read in NCRMP benthic LPI data and select only SampleIDs in fish data
+
+```{r, Define functions for reading in NRCMP .csvs}
+#Bind all benthic datasets into one, add same columns as fish data
+benthList<-list(USVI_2021_benthic_cover,
+                USVI_2019_benthic_cover,
+                USVI_2017_benthic_cover,
+                USVI_2015_benthic_cover,
+                Tortugas_2020_benthic_cover,
+                Tortugas_2018_benthic_cover,
+                TortugasMarq_2016_benthic_cover,
+                SEFCRI_2020_benthic_cover,
+                SEFCRI_2018_benthic_cover,
+                SEFCRI_2016_benthic_cover,
+                PRICO_2021_benthic_cover,
+                PRICO_2019_benthic_cover,
+                PRICO_2016_benthic_cover)
+
+#convert to dataframe and add standardizing columns
+ncrmpBenth<-setDT(Reduce(function(x, y) merge(x, y, all=TRUE), benthList) %>%
+  mutate(SampleID=paste(MAPGRID_NR,YEAR,sep="-"), #unique ID column
+   latlong = paste(LAT_DEGREES, LON_DEGREES),  #GPS coords
+   date = ymd(paste(YEAR, MONTH, DAY, sep="-")),
+   surveytype = "benthic"))%>%
+  filter(!SampleID == "379048-2019")%>% #issue#3 explained below
+ filter(!SampleID %in% c("1975761-2016","1966358-2016","1926932-2016","1811333-2016","1804147-2016","1812230-2016","1798011-2016","1815963-2016","985741-2016","1112984-2016","929947-2016","1888013-2018", "1063027-2018","319746-2021","456853-2021","408212-2021","482688-2021","576045-2021","495279-2021","607819-2021","566772-2021","623914-2021","602895-2021","265062-2021", "1178410-2021")) #Issue #4, explained below
+
+#Issue #2 explained below: rename this specific sampleID because there were two visits to this Mapgrid# in the same year that were far apart
+ncrmpBenth$SampleID[ncrmpBenth$SampleID =="308716-2019" & ncrmpBenth$date == "2019-06-04"]<-"308716-2019_2"
+
+# select only SampleIDs that overlap with fish AND coral data 
+ncrmpBenthInFishANDCoral <- ncrmpBenth %>%
+  filter(SampleID %in% ncrmpFish$SampleID & SampleID %in% ncrmpCoral$SampleID)
+
+# Make a summarizing df selecting only geospatial and temporal metadata columns
+ncrmpBenthInFishANDCoralSummary<- ncrmpBenthInFishANDCoral %>%
+  dplyr::select(SampleID, LAT_DEGREES, LON_DEGREES, REGION, date, YEAR, surveytype)%>%
+  unique()
+
+### USE THE DOWNLOADED DATA IF HAVING TROUBLE WITH THE BENTHICS PACKAGE
+write.csv(ncrmpBenth, "data/outputs/ncrmpBenth.csv")
+#ncrmpBenth <- read_csv( "data/outputs/ncrmpBenth.csv")
+```
+
+## Make fish dataframe that overlaps with coral and benthic surveys
+- Make a summary of this as well, with only spatial and temporal information for geospatial/temporal merging
+
+```{r}
+# Select fish data that overlaps with coral data (overlapping SampleIDs/Mapgrid years)
+fishInCoral <- ncrmpFish %>%
+  filter(SampleID %in% ncrmpCoralInFishSummary$SampleID)
+
+n_distinct(fishInCoral$SampleID) # 1727 SampleIDs overlap between fish and Coral
+
+#make a summary table of these data (just metadata) - 1918 rows
+fishInCoralSummary <- fishInCoral%>%
+  dplyr::select(SampleID, LAT_DEGREES, LON_DEGREES, REGION, date, YEAR, surveytype)%>%
+  unique()
+
+# Select fish data that overlaps with coral data (overlapping SampleIDs/Mapgrid years)
+fishInCoralANDBenth <- ncrmpFish %>%
+  filter(SampleID %in% ncrmpCoralInFishSummary$SampleID & SampleID %in% ncrmpBenthInFishANDCoralSummary$SampleID)
+
+# 1659 SampleIDs overlap between fish, coral AND benthic
+n_distinct(fishInCoralANDBenth$SampleID)
+
+#make a summary table of these data (just metadata) - 1802 rows
+fishInCoralANDBenthSummary <- fishInCoralANDBenth %>%
+  dplyr::select(SampleID, LAT_DEGREES, LON_DEGREES, REGION, date, YEAR, surveytype)%>%
+  unique()
+
+#export fishInCoralSummary for SampleID coordinates for mapping SEM predictions
+write.csv(fishInCoralSummary, "data/outputs/fishInCoralXY.csv")
+
+```
+
+## Do geospatial-temporal merge for a) fish and coral 
+- If surveys have the same SampleID (mapgrid# and year), check distance and time between surveys
+      ### fixing fish+coral pairs where >=100m apart or >= 90 days apart
+
+``` {r}
+# merge fish and coral "summary" dfs and calculate distances each survey to the midpoint of all surveys within that SampleID
+# there are many fish surveys with TWO XY coordinates taken at the same time. This shows that every fish survey has a corresponding coral survey <=100 m away
+fishCoralGeospatial<- fishInCoralSummary %>% 
+  full_join(ncrmpCoralInFishSummary, by = "SampleID") %>% # should have 1928 rows
+  rename(LAT_DEGREES_coral = LAT_DEGREES.y,
+         LON_DEGREES_coral = LON_DEGREES.y,
+         date_coral = date.y,
+         year_coral = YEAR.y,
+         LAT_DEGREES_fish = LAT_DEGREES.x, 
+         LON_DEGREES_fish = LON_DEGREES.x, 
+         date_fish = date.x, 
+         year_fish = YEAR.x) %>% 
+  dplyr::select(-c(surveytype.x, surveytype.y)) %>%
+  mutate(distance_m = distHaversine(matrix(cbind(LON_DEGREES_coral, LAT_DEGREES_coral), ncol = 2),
+  matrix(c(LON_DEGREES_fish, LAT_DEGREES_fish), ncol = 2)), #distance between fish and coral surveys within same SampleID
+  daysbtwn=abs(date_coral-date_fish)) # calculate time between fish and coral as well 
+
+#Inspect distances and days between 
+#View(fishCoralGeospatial)
+
+####################################Issue 1: 
+#looks like a typo in FISH 791405-2021 - longitude should be "-65.07960" like in coral instead of "-64.07960" (checked on a map, and it's not over reef or close to any other USVI sites)
+# add this to fish data at beginning of script: 
+# ncrmpFish$LON_DEGREES[ncrmpFish$SampleID =="791405-2021" & ncrmpFish$date == "2021-08-06"]<- -65.07960
+
+####################################Issue 2:
+# After inspecting fishCoralGeospatial, deciding to split up 2 sets of surveys in Sample ID 308716-2019, dates 2019-06-04 and 2019-06-10, as they are very far apart and there is a pair of coral and fish for both dates.
+
+# Make the following change to SampleID names based on the distances observed (but move to beginning of script)  
+# ncrmpFish$SampleID[ncrmpFish$SampleID =="308716-2019" & ncrmpFish$date == "2019-06-04"]<-"308716-2019_2"
+# ncrmpCoral$SampleID[ncrmpCoral$SampleID =="308716-2019" & ncrmpCoral$date == "2019-06-04"]<-"308716-2019_2"
+# ncrmpBenth$SampleID[ncrmpBenth$SampleID =="308716-2019" & ncrmpBenth$date == "2019-06-04"]<-"308716-2019_2"
+
+####################################Issue 3:
+# find SampleIDs where surveys are >100m from each other. These are: 
+fishCoralGeospatial%>%
+  filter(distance_m>100)%>%
+  dplyr::select(SampleID)
+
+# remove these from fish, coral and benthic surveys by adding following code to pipes earlier
+# %>% filter(!SampleID = 379048-2019)
+
+####################################Issue 4: 
+# remove all SampleIDs where fish and coral surveys were >90 days apart
+temporalViolations <- fishCoralGeospatial%>%
+  filter(daysbtwn>90)%>%
+  dplyr::select(SampleID)%>%
+  unique()
+
+list(temporalViolations$SampleID) #should be 0 now
+
+# use code below to remove these from dfs earlier in the script
+ # %>% dplyr::select(-c("1975761-2016","1966358-2016","1926932-2016","1811333-2016","1804147-2016","1812230-2016","1798011-2016","1815963-2016","985741-2016","1112984-2016","929947-2016","1888013-2018" "1063027-2018","319746-2021","456853-2021","408212-2021","482688-2021","576045-2021","495279-2021","607819-2021","566772-2021","623914-2021","602895-2021","265062-2021", "1178410-2021"))
+```
+
+## Do geospatial-temporal merge for b) coral and benthic data - should have been done in the same place/time, but just double check
+- If surveys have the same SampleID (mapgrid# and year), check distance and time between surveys
+
+``` {r}
+# merge benthic and coral "summary" dfs and calculate distances each survey to the midpoint of all surveys within that SampleID
+benthCoralGeospatial<- ncrmpBenthInFishANDCoralSummary %>% 
+  full_join(ncrmpCoralInFishSummary, by = "SampleID")  %>% # should have 1742 rows
+  rename(LAT_DEGREES_coral = LAT_DEGREES.y,
+         LON_DEGREES_coral = LON_DEGREES.y,
+         date_coral = date.y,
+         year_coral = YEAR.y,
+         LAT_DEGREES_benth = LAT_DEGREES.x, 
+         LON_DEGREES_benth = LON_DEGREES.x, 
+         date_benth = date.x, 
+         year_benth = YEAR.x) %>% 
+  mutate(date_coral = as.Date(date_coral), 
+         date_benth = as.Date(date_benth))%>%
+  dplyr::select(-c(surveytype.x, surveytype.y)) %>%
+  mutate(distance_m = distHaversine(matrix(cbind(LON_DEGREES_coral, LAT_DEGREES_coral), ncol = 2),
+  matrix(c(LON_DEGREES_benth, LAT_DEGREES_benth), ncol = 2)), #distance between benth and coral surveys within same SampleID
+  daysbtwn=abs(date_coral-date_benth)) # calculate time between benth and coral as well 
+
+#Inspect distances and days between - looks good. 
+#View(benthCoralGeospatial)
+```
+
+# III. Calculate benthic summary statistics
+## Calculate cover for coral species and overall coral cover
+
+```{r}
+# areas of individual species and total amount of coral
+coralAreasLive <- ncrmpCoralInFish %>%  # use subsetted data
+  dplyr::select(SampleID, METERS_COMPLETED, SPECIES_NAME, N, MAX_DIAMETER, PERP_DIAMETER, OLD_MORT, RECENT_MORT) %>% 
+  filter(!is.na(SPECIES_NAME))%>%
+  mutate(areaSurveyedCM = 100000, # 2D area surveyed
+         colonyArea = ifelse(N==0, 0, (MAX_DIAMETER/2)*(PERP_DIAMETER/2)*pi), 
+         OLD_MORT = OLD_MORT/100, 
+         RECENT_MORT = RECENT_MORT/100, 
+         old_mort_area = OLD_MORT*colonyArea, 
+         recent_mort_area = RECENT_MORT*colonyArea,
+         liveCoralArea = colonyArea - (old_mort_area + recent_mort_area))%>% #calculate area of individual colony, with 0s input for absences
+  dplyr::select(SampleID, SPECIES_NAME, liveCoralArea, areaSurveyedCM, old_mort_area, recent_mort_area) %>%  #select relevant columns
+  replace(is.na(.), 0) %>% #replace NAs (from NA diameters)  with 0s
+  group_by(SampleID, SPECIES_NAME, areaSurveyedCM) %>%
+  summarise(speciesArea = sum(liveCoralArea)) %>%
+  ungroup()%>%
+  pivot_wider(id_cols = c(SampleID, areaSurveyedCM), names_from = SPECIES_NAME, values_from = speciesArea) %>%
+  replace(is.na(.), 0)
+
+```
+
+## Summarize benthic data into functional groups
+
+``` {r}
+benthFuncGroups <- ncrmpBenthInFishANDCoral %>%
+  dplyr::select(SampleID, surveytype, HARDBOTTOM_P, SOFTBOTTOM_P, RUBBLE_P, COVER_CAT_NAME)%>%
+  mutate(coverPtsTotal = HARDBOTTOM_P + SOFTBOTTOM_P+ RUBBLE_P)%>%
+  pivot_wider(names_from = COVER_CAT_NAME, values_from = coverPtsTotal, values_fn = sum) %>%
+  replace(is.na(.), 0)%>%
+  group_by(SampleID) %>%
+  summarise(across(where(is.numeric), ~ sum(., is.na(.), 0)))%>%
+  mutate(noPtsTotal = HARDBOTTOM_P+ SOFTBOTTOM_P+ RUBBLE_P)
+```
+
+## Save coral species and benthic functional group names in the dataset
+
+```{r}
+ncrmpCoralCodes <- ncrmpCoralInFish%>%
+  filter(!N==0)%>%
+  dplyr::select(SPECIES_NAME)%>%
+  group_by(SPECIES_NAME)%>%
+  summarise(n_occurrences = n())
+
+#write_csv(ncrmpCoralCodes, "data/outputs/ncrmpCoralCodes_raw.csv")
+
+#save wide-format benthic dataframe
+#write_csv(benthFuncGroups, "data/outputs/ncrmpBenthWide.csv")
+```
+
+## Make a dataframe for site-specific metadata
+
+```{r}
+metaBenth <- ncrmpBenthInFishANDCoral%>% 
+  select(SampleID, REGION, SUB_REGION_NAME, YEAR, MONTH, WTD_RUG, MEAN_RUG, MIN_DEPTH, MAX_DEPTH) %>%
+  group_by(SampleID) %>%
+  mutate(WTD_RUG = mean(WTD_RUG), 
+         MEAN_RUG = mean(MEAN_RUG), 
+         MIN_DEPTH = mean(MIN_DEPTH),
+         MAX_DEPTH = mean(MAX_DEPTH))%>%
+  unique() %>%
+  mutate(newRug = ifelse(is.na(WTD_RUG), MEAN_RUG, WTD_RUG),
+         depthDiff = MAX_DEPTH-MIN_DEPTH, 
+         rugosityMethod = as.factor(ifelse(is.na(WTD_RUG), "MEAN_RUG", "WTD_RUG")))
+```
+
+## Make dataframe of percent cover of benthic functional groups of interest
+
+```{r}
+#read in benthic and coral codes lookup table
+ncrmpBenthicCodes <-read_excel("data/ncrmpSpeciesCodes.xlsx")
+
+#This combines codes into total number of points for each category
+benthCats <- benthFuncGroups%>%
+  filter(SampleID %in% coralAreasLive$SampleID)%>%
+  pivot_longer(!c(SampleID, noPtsTotal), names_to = "Code", values_to = "count") %>% #convert to long for substituting categories
+  left_join(ncrmpBenthicCodes, by="Code") %>% #join with codes reference table
+  group_by(SampleID, noPtsTotal, Category) %>%
+  summarise(count = sum(count)) %>%
+  filter(Category %in% c("cyanobacteria","fireCoral", "macroCalc","macroFleshy", "CCA")) %>%
+  ungroup()%>%
+  mutate(propCat = count/noPtsTotal)%>%
+  pivot_wider(names_from = "Category", values_from = "propCat")%>%
+  group_by(SampleID) %>%
+  replace(is.na(.), 0) %>%
+  summarise(across(where(is.numeric), ~ sum(., is.na(.), 0))) %>%
+  mutate(macroalgae = macroCalc + macroFleshy) %>%
+  select(-c(macroCalc, macroFleshy,noPtsTotal, count)) 
+```
+
+## Get proportions of susceptible and resistant coral from coral demography data
+
+```{r}
+propSusc <- coralAreasLive %>%
+  pivot_longer(!c(SampleID, areaSurveyedCM), names_to = "Code", values_to = "area") %>% #convert to long for subbing
+  left_join(ncrmpBenthicCodes, by="Code") %>%  #join with codes reference table
+  group_by(SampleID, Category, areaSurveyedCM)%>%
+  summarise(area = sum(area)) %>%
+  filter(!Category == "unkCoral")%>%
+  pivot_wider(id_cols = c("SampleID", "areaSurveyedCM"),names_from = "Category", values_from = "area")%>%
+  rename(areaResistant = resistantCoral, 
+         areaSusc = suscCoral)%>%
+  mutate(propSusc = areaSusc/areaSurveyedCM, 
+         propResistant = areaResistant/areaSurveyedCM)
+```
+
+
+## Combine benthic functional groups and coral proportions into single dataframe
+
+```{r}
+benthAll <-  metaBenth %>%
+  left_join(benthCats, by = "SampleID") %>%
+  left_join(propSusc, by = "SampleID")
+```
+
+# IV. Calculate fish summary statistics
+
+## Approximate fish biomass from WLEN approximations
+
+```{r}
+fish2 <- fishInCoralANDBenth %>%
+  dplyr::select(SampleID, SPECIES_NR, SPECIES_CD, LEN, NUM) %>%
+  filter(!NUM==0)
+n_distinct(fish2$SPECIES_NR)#328
+n_distinct(fish2$SPECIES_CD)#328
+
+fishSpeciesList <- fish2%>% #328 species
+  dplyr::select(SPECIES_CD)%>%
+  unique()
+
+fishCodes <- read_excel("data/ncrmpFishSpeciesList.xlsx") %>%
+  filter(!is.na(ncrmpName)) 
+
+## Get taxonomic data for all species as a data.frame, from rvc package
+taxonomic_data = getTaxonomicData()
+
+fishTotals <- fish2 %>%
+  left_join(fishCodes, by = "SPECIES_CD")%>%
+  filter(!is.na(ncrmpName))%>%
+  filter(!is.na(fishCat05Jan23))%>%
+  mutate(lenMM = 10*LEN, 
+         gramsCalculated = (WLENAapprox * lenMM^WLENBapprox)*NUM) %>%
+  group_by(SampleID) %>%
+  summarise(totalBiomass = sum(gramsCalculated))
+
+
+fishCat05Jan23 <- fish2 %>%
+  left_join(fishCodes, by = "SPECIES_CD") %>%
+  filter(!is.na(ncrmpName))%>%
+  filter(!fishCat05Jan23=="NA")%>%
+  mutate(lenMM = 10*LEN, 
+         gramsCalculated = (WLENAapprox * lenMM^WLENBapprox)*NUM)%>%
+  dplyr::select(SampleID, gramsCalculated, fishCat05Jan23) %>%
+  group_by(SampleID, fishCat05Jan23)%>%
+  summarise(sumCat = sum(gramsCalculated))%>%
+  pivot_wider(names_from = "fishCat05Jan23", values_from = "sumCat")%>% 
+  replace(is.na(.), 0) 
+
+
+fishBenthCombined<- fishTotals%>%
+  left_join(fishCat05Jan23, by = "SampleID")%>%
+  filter(SampleID %in% benthAll$SampleID)%>%
+  left_join(benthAll, by = "SampleID")%>%
+  select(-c(WTD_RUG, MEAN_RUG, MIN_DEPTH, depthDiff))
+
+write_csv(fishBenthCombined, "data/outputs/ncrmp_fishBenthCombined.csv")
+```
+
+## Use mundlak devices to create group-centered and regional means for modeling
+
+```{r}
+ncrmp <- fishBenthCombined %>% #filtered to std transect length in Geospatial merge
+  filter(!REGION=="SEFCRI") %>% #only 2 surveys in this region
+  filter(!SampleID=="1604607-2016") %>% #remove a total Fish Biomass outlier
+  # filter(!SampleID == "1597587-2018")%>% #remove an herbivor outlier
+  filter(!is.na(newRug)) %>% # remove rows missing rugosity data (FOR NOW)
+  filter(!is.na(MAX_DEPTH)) %>% # remove rows missing depth data (FOR NOW)
+  filter(!newRug==0) %>%
+  filter(!SUB_REGION_NAME=="Tortugas--Unmapped") %>%
+  mutate(REGIONBINARY = ifelse(REGION %in% c("PRICO", "STTSTJ", "STX"), 1, 0), #make a binary (caribbean = 1, FL = 0 region category)
+         SEASON = as.factor(ifelse(MONTH %in% c(11, 12, 1, 2, 3, 4), "cool", #make a binary season category (warm vs. cool)
+                                   ifelse(MONTH %in% c(5, 6, 7, 8, 9, 10), "warm", NA))), 
+         REGION = as.factor(REGION), #make region, subregion, and season into factors
+         SEASON = as.factor(SEASON),
+         SUB_REGION_NAME = as.factor(SUB_REGION_NAME)) %>%
+  mutate(logNewRug = log(newRug), 
+         logOtherFish = log(otherFish), 
+         logCoralAssoc = log(coralAssociated), 
+         logHerb = log(herb)) %>%
+  mutate(areaSusc = areaSusc/1000,
+         areaResistant = areaResistant/1000,
+         otherFish = otherFish/1000,
+         herb = herb/1000,
+         coralAssociated = coralAssociated/1000)
+
+ncrmpMundlak <- ncrmp %>% 
+  group_by(SUB_REGION_NAME) %>%
+  mutate(mean_SR_susc_cover = mean(propSusc),
+         sd_SR_susc_cover = sd(propSusc),
+         susc_GC = (propSusc-mean_SR_susc_cover)/sd_SR_susc_cover) %>%
+  mutate(mean_SR_resistant_cover = mean(propResistant),
+         sd_SR_resistant_cover = sd(propResistant),
+         resistant_GC = (propResistant-mean_SR_resistant_cover)/sd_SR_resistant_cover) %>%
+  mutate(mean_SR_cyano = mean(cyanobacteria), 
+         sd_SR_cyano = sd(cyanobacteria), 
+         cyano_GC = (cyanobacteria-mean_SR_cyano)/sd_SR_cyano) %>%
+  mutate(macroalgae = ifelse(macroalgae>1, 0.999999, macroalgae)) %>%
+  mutate(mean_SR_macro = mean(macroalgae), 
+         sd_SR_macro = sd(macroalgae), 
+         macro_GC = (macroalgae-mean_SR_macro)/sd_SR_macro) %>%
+  mutate(mean_SR_fire = mean(fireCoral), 
+         sd_SR_fire = sd(fireCoral), 
+         fire_GC = (fireCoral-mean_SR_fire)/sd_SR_fire) %>%
+  mutate(mean_SR_cca = mean(CCA), 
+         sd_SR_cca = sd(CCA), 
+         cca_GC = (CCA-mean_SR_cca)/sd_SR_cca) %>%
+  ungroup()
+
+ncrmpMundlak <- ncrmpMundlak %>%
+  group_by(SUB_REGION_NAME, rugosityMethod) %>%
+  mutate(mean_SR_rugosity = mean(logNewRug), 
+         sd_SR_rugosity = sd(logNewRug), 
+         rugosity_GC = (logNewRug-mean_SR_rugosity)/sd_SR_rugosity) 
+
+write.csv(ncrmpMundlak, file = "data/outputs/ncrmp_simple.csv")
+```
+
