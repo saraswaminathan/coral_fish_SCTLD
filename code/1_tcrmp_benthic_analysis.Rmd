@@ -1,0 +1,1046 @@
+---
+title: "1. Territorial Coral Reef Monitoring Program Benthic Analysis"
+author: "Sara Devi Swaminathan"
+date: "`r Sys.Date()`"
+output: html_document
+toc: true
+toc_float: true
+number_sections: true
+---
+# I. Getting raw data model-ready
+## Install Packages and set working directory
+
+```{r setup, include = FALSE, cache = FALSE}
+#install.packages("rstan", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+library(readxl)
+library(tidyverse)
+library(brms)
+library(parallel)
+library(tidybayes)
+library(bayesplot)
+
+## this sets the markdown working directory to the project folder
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) 
+```
+
+## Read in Benthic Demography data and format
+
+```{r}
+### "TCRMP_Master_Benthic_Cover_Feb2022.xlsx" was downloaded from the TCRMP data repository: https://sites.google.com/site/usvitcrmp/available-data?authuser=0
+benthicFull <- read_excel("data/TCRMP_Master_Benthic_Cover_Feb2022.xlsx")%>%  
+  rename(Site = Location, # rename Location as Site
+         Date = FilmDate) %>% # This is date surveyed
+  mutate(Date = as.Date(Date),  # format as date
+         Year = year(Date), # make year column from survey date
+         Month = month(Date), # make month column from survey date
+         SampleID = paste(Site,Year,Month, sep="-")) %>% # SampleID column for unique survey points (all transects at site have same SampleID)
+  relocate(c(SampleID, 
+             Year, 
+             Month), 
+           .before= SampleYear) %>% #move important columns to front
+  relocate(NoPts, .after = Date) %>% 
+  select(-c(AnalysisBy, 
+            AnalysisDate, 
+            Period, 
+            PC, 
+            SampleYear, 
+            SampleMonth)) #remove unused columns
+```
+
+
+## Read in benthic codes data that matches TCRMP codes with functional groups
+
+```{r}
+benthCodes<-read_xlsx("data/TcrmpBenthicCodes.xlsx") %>%
+  filter(Code %in% names(benthicFull) )  # Subset to include only codes in benthicFull
+```
+
+## Summarize data by functional group
+
+```{r}
+#This collapses codes into total number of points for each category
+benthCats <- benthicFull%>%
+  pivot_longer(!c(SampleID, Site, Year, Transect, Month, Date, TWS, NoPts), names_to = "Code", values_to = "count") %>% #convert to long format for substitutions
+  left_join(benthCodes, by="Code")%>% #join with codes reference table
+  group_by(SampleID, Site, Year, Transect,Month, Date, NoPts, TWS, Category)%>% 
+  summarise(count = sum(count)) %>%
+  pivot_wider(id_cols = c(SampleID, Site, Year, Month, Date,Transect,TWS, NoPts), names_from = "Category", values_from = "count") %>% # pivot wider for categories as columns
+  mutate(tottws = NoPts - TWS)%>%
+  relocate(tottws, .before = "BLCov")%>%
+  select(-c(TWS, UnkCov, OtherLiveCov, NonLiveCov, DisCov, BLCov)) #remove columns we won't use
+
+```
+
+## Calculate % cover for each functional group
+
+```{r}
+pctCov <- benthCats %>%
+  mutate_at(vars(CalgCov:ZoanCov), 
+            funs ((. / tottws))) %>%  
+  rename_at(vars(CalgCov:ZoanCov), 
+            list( ~paste("pctCov", gsub("_pctCov", "", .), sep = "_")))
+```
+
+## Import site metadata and add to pctCov
+
+```{r}
+# Import site metadata
+tcrmpMeta<-read_excel("data/TCRMP_SiteMetadata_SCTLDInf.xlsx")%>%
+  rename(Site=Location)%>%
+  mutate(InfectionDate = as.Date(InfectionDate, format =  "%m/%d/%Y"))
+
+# Add site metadata to %cover dataframe
+tcrmp_meta_pctcov <- pctCov%>%
+  left_join(tcrmpMeta, by = "Site")%>%
+  #relocate(c(Code:InfectionDate), .after = "Site")%>% 
+  mutate(prePost = NA, #Make a pre-post column
+  daysSinceInf=Date-InfectionDate) %>% #date minus infection date is number of days since infected (negative numbers tell you how soon before first sighting)
+  relocate(Code:daysSinceInf, .after = "tottws")
+
+```
+
+## Categorize each survey date as either pre or post infection based on infection dates
+
+```{r}
+#populate the pre-post column
+tcrmp_meta_pctcov$prePost[tcrmp_meta_pctcov$Date<=tcrmp_meta_pctcov$InfectionDate]<-"pre" #if date is before infection date, pre
+tcrmp_meta_pctcov$prePost[tcrmp_meta_pctcov$Date>=tcrmp_meta_pctcov$InfectionDate]<-"post" #if date is after infection date, post
+
+#-Make the days since variable numeric-#
+tcrmp_meta_pctcov$daysSinceInf <- str_replace(tcrmp_meta_pctcov$daysSinceInf, " days", "")
+tcrmp_meta_pctcov$daysSinceInf <- as.numeric(tcrmp_meta_pctcov$daysSinceInf)
+
+#-Create a years since infection variable where all of the pre-SCTLD values are pooled-#
+tcrmp_meta_pctcov$yearsSinceInf <- tcrmp_meta_pctcov$daysSinceInf/365
+tcrmp_meta_pctcov$yearsSinceInf[which(tcrmp_meta_pctcov$yearsSinceInf < 0)] <- 0
+
+tcrmp_meta_pctcov <- tcrmp_meta_pctcov %>%
+  relocate(yearsSinceInf, 
+           .after = daysSinceInf)
+```
+
+
+## Save data to file 
+
+```{r}
+write.csv(tcrmp_meta_pctcov, "data/outputs/benthicTCRMP.csv")
+```
+
+
+# Run brm of each transformed variable by "Years since infection"
+## First, set instructions for sampler
+
+```{r}
+n_cores <- detectCores() # this will determine how many cores your computer has so that it can use all of its processing power
+n_chains <- 2 
+n_iter <- 8000
+n_warmup <- 2000
+
+#-Also add a function to make it easier when we're working with logit-transformed data-#
+logit <- function(mu) {
+  logit_mu <- log(mu/ (1 - mu))
+  return(logit_mu)
+}
+
+#-Set inits-#
+init_func <- function(chain_id = 1) {
+  list ( Intercept  =  runif(1, .01, .1),
+         b  =   runif(1, .001, .01),
+         phi  =   runif(1, .001, .01),
+         sd  =   runif(1, .001, .01),
+         cor = runif(1, 0.001, .01),
+         zi = runif(1, 0.001, .01))
+}
+
+# Create different inits for each chain
+
+init_list <- vector(mode = "list", length = n_chains)
+
+for(i in 1:n_chains)  
+  {
+  init_list[[i]] <- init_func(chain_id = i)
+  }
+
+```
+
+
+## CCA model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_CalgCov)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+# subset just the Black Point site data because this will be reference level 
+BlackPointData <- tcrmp_meta_pctcov %>%
+  filter(Site=="Black Point")
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_CalgCov) #-we'll work with the zero-inflated beta
+
+#define model
+cca_mod <- bf(pctCov_CalgCov ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              zi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              family =  zero_inflated_beta(link = "logit", link_phi = "log", link_zi = "logit"))
+
+##### Get priors
+get_prior(cca_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_Calg <- BlackPointData %>%
+              filter(pctCov_CalgCov> 0)
+
+logit(mean(BPD_Calg$pctCov_CalgCov)) #-5.2
+
+##### Set priors
+cca_prior <- c(prior(normal(-5.2, 1), class = "Intercept"),
+               prior(logistic(0, 1), class = "Intercept", dpar = "zi"),
+               prior(normal(0, 1), class = "b"),
+               prior(normal(0, 1), class = "b", dpar = "zi"),
+               prior(lkj(2), class = "cor"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"),
+               prior(exponential(1), class = "sd", dpar = "zi"))
+
+##### Uncomment below to run model                         
+# cca_brm <- brm(cca_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = cca_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Save model and/or read in saved model
+#saveRDS(cca_brm, "data/outputs/cca_brm.RDS")
+cca_brm <- readRDS("data/outputs/cca_brm.RDS")
+
+
+##### Look at model       
+cca_brm 
+
+#posterior predictive checks
+pp_check(cca_brm, type = "hist", ndraws = 11) 
+pp_check(cca_brm, type = "boxplot", ndraws = 6)
+pp_check(cca_brm, type = "dens_overlay", ndraws = 100) 
+
+y <- posterior_predict(cca_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_CalgCov*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+## Cyanobacteria model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_CyanCov)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_CyanCov) #-we'll work with the zero-inflated beta
+
+#define model
+cyano_mod <- bf(pctCov_CyanCov ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              zi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              family =  zero_inflated_beta(link = "logit", link_phi = "log", link_zi = "logit"))
+
+##### Get priors
+get_prior(cyano_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_Cyano <- BlackPointData %>%
+              filter(pctCov_CyanCov> 0)
+
+logit(mean(BPD_Cyano$pctCov_CyanCov)) #-3.04
+
+##### Set priors
+cyano_prior <- c(prior(normal(-3, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+              prior(logistic(0, 1), class = "Intercept", dpar = "zi"),
+               prior(normal(0, 1), class = "b", dpar = "zi"),
+               prior(exponential(1), class = "sd", dpar = "zi"),
+               prior(lkj(2), class = "cor"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment below to run model              
+# cyano_brm <- brm(cyano_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = cyano_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Save model and/or read in saved model
+#saveRDS(cyano_brm, "data/outputs/cyanobacteria_brm.RDS")
+cyano_brm <- readRDS("data/outputs/cyanobacteria_brm.RDS")
+
+##### Look at model  
+cyano_brm 
+
+# posterior predictive checks
+pp_check(cyano_brm, type = "hist", ndraws = 11) 
+pp_check(cyano_brm, type = "boxplot", ndraws = 6)
+pp_check(cyano_brm, type = "dens_overlay", ndraws = 100)
+
+y <- posterior_predict(cyano_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_CyanCov*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+## Fire coral model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_HydrozoanCoral)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_HydrozoanCoral) #-we'll work with zero-inflated beta
+
+#define model
+fireCoral_mod <- bf(pctCov_HydrozoanCoral ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              zi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              family =  zero_inflated_beta(link = "logit", link_phi = "log", link_zi = "logit"))
+
+##### Get priors
+get_prior(fireCoral_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_fireCoral <- BlackPointData %>%
+              filter(pctCov_HydrozoanCoral> 0)
+
+logit(mean(BPD_fireCoral$pctCov_HydrozoanCoral)) #-5.5
+
+##### Set priors
+fireCoral_prior <- c(prior(normal(-5.5, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+               prior(lkj(2), class = "cor"),
+               prior(logistic(0, 1), class = "Intercept", dpar = "zi"),
+               prior(normal(0, 1), class = "b", dpar = "zi"),
+               prior(exponential(1), class = "sd", dpar = "zi"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment to run model                         
+# fireCoral_brm <- brm(fireCoral_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = fireCoral_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Uncomment below to save model and/or read in saved model
+#saveRDS(fireCoral_brm, "data/outputs/fireCoral_brm.RDS")
+fireCoral_brm <- readRDS("data/outputs/fireCoral_brm.RDS")
+
+##### Look at model         
+fireCoral_brm 
+
+# posterior predictive checks
+pp_check(fireCoral_brm, type = "hist", ndraws = 11) 
+pp_check(fireCoral_brm, type = "boxplot", ndraws = 6)
+pp_check(fireCoral_brm, type = "dens_overlay", ndraws = 100)
+
+y <- posterior_predict(fireCoral_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_HydrozoanCoral*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+## Gorgonian model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_GorgCov)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_GorgCov) #-we'll work with zero-inflated beta
+
+#define model
+gorgo_mod <- bf(pctCov_GorgCov ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              zi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              family =  zero_inflated_beta(link = "logit", link_phi = "log", link_zi = "logit"))
+
+##### Get priors
+get_prior(gorgo_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_gorgo <- BlackPointData %>%
+              filter(pctCov_GorgCov> 0)
+
+logit(mean(BPD_gorgo$pctCov_GorgCov)) #-3.6
+
+##### Set priors
+gorgo_prior <- c(prior(normal(-3.6, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+               prior(lkj(2), class = "cor"),
+               prior(logistic(0, 1), class = "Intercept", dpar = "zi"),
+               prior(normal(0, 1), class = "b", dpar = "zi"),
+               prior(exponential(1), class = "sd", dpar = "zi"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment to run model                
+# gorgo_brm <- brm(gorgo_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = gorgo_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Save model and/or read in saved model
+#saveRDS(gorgo_brm, "data/outputs/gorgonian_brm.RDS")
+gorgo_brm<- readRDS("data/outputs/gorgonian_brm.RDS")
+
+##### Look at model   
+gorgo_brm 
+
+#posterior predictive checks
+pp_check(gorgo_brm, type = "hist", ndraws = 11) 
+pp_check(gorgo_brm, type = "boxplot", ndraws = 6)
+pp_check(gorgo_brm, type = "dens_overlay", ndraws = 100)
+
+y <- posterior_predict(gorgo_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_GorgCov*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+## Macroalgae model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_MacaCov)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_MacaCov) #-we'll work with beta
+
+#define model
+macro_mod <- bf(pctCov_MacaCov ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+                    family = Beta(link = "logit", link_phi = "log"))
+
+##### Get priors
+get_prior(macro_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_macro <- BlackPointData %>%
+              filter(pctCov_MacaCov> 0)
+
+logit(mean(BPD_macro$pctCov_MacaCov)) #-1
+
+##### Set priors
+macro_prior <- c(prior(normal(-1, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+               prior(lkj(2), class = "cor"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment to run model
+# macro_brm <- brm(macro_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = macro_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Save model and/or read in saved model
+#saveRDS(macro_brm, "data/outputs/macroalgae_brm.RDS")
+macro_brm<- readRDS("data/outputs/macroalgae_brm.RDS")
+
+##### Look at model
+macro_brm 
+
+#posterior predictive checks
+pp_check(macro_brm, type = "hist", ndraws = 11) 
+pp_check(macro_brm, type = "boxplot", ndraws = 6)
+pp_check(macro_brm, type = "dens_overlay", ndraws = 100) #looks good
+
+y <- posterior_predict(macro_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_MacaCov*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+
+## SCTLD-resistant coral model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_ResistantCoral)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_ResistantCoral) #-we'll work with zero-inflated beta
+
+#define model
+resistantCoral_mod <- bf(pctCov_ResistantCoral ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              zi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              family =  zero_inflated_beta(link = "logit", link_phi = "log", link_zi = "logit"))
+
+##### Get priors
+get_prior(resistantCoral_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_resistantCoral <- BlackPointData %>%
+              filter(pctCov_ResistantCoral> 0)
+
+logit(mean(BPD_resistantCoral$pctCov_ResistantCoral)) #-2.8
+
+##### Set priors
+resistantCoral_prior <- c(prior(normal(-2.8, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+               prior(lkj(2), class = "cor"),
+               prior(logistic(0, 1), class = "Intercept", dpar = "zi"),
+               prior(normal(0, 1), class = "b", dpar = "zi"),
+               prior(exponential(1), class = "sd", dpar = "zi"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment to run model                
+# resistantCoral_brm <- brm(resistantCoral_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = resistantCoral_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Uncomment below to save model and/or read in saved model
+#saveRDS(resistantCoral_brm, "data/outputs/resistantCoral_brm.RDS")
+resistantCoral_brm <- readRDS("data/outputs/resistantCoral_brm.RDS")
+
+##### Look at model       
+resistantCoral_brm 
+
+#posterior predictive checks
+pp_check(resistantCoral_brm, type = "hist", ndraws = 11) 
+pp_check(resistantCoral_brm, type = "boxplot", ndraws = 6)
+pp_check(resistantCoral_brm, type = "dens_overlay", ndraws = 100) 
+
+y <- posterior_predict(resistantCoral_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_ResistantCoral*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+## SCTLD-susceptible coral model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_SuscCoral)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_SuscCoral) #-we'll work with zero-inflated beta
+
+#define model
+SuscCoral_mod <- bf(pctCov_SuscCoral ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              zi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              family =  zero_inflated_beta(link = "logit", link_phi = "log", link_zi = "logit"))
+
+##### Get priors
+get_prior(SuscCoral_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_SuscCoral <- BlackPointData %>%
+              filter(pctCov_SuscCoral> 0)
+
+logit(mean(BPD_SuscCoral$pctCov_SuscCoral)) #-2.4
+
+##### Set priors
+SuscCoral_prior <- c(prior(normal(-2.4, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+               prior(lkj(2), class = "cor"),
+               prior(logistic(0, 1), class = "Intercept", dpar = "zi"),
+               prior(normal(0, 1), class = "b", dpar = "zi"),
+               prior(exponential(1), class = "sd", dpar = "zi"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment to run model                       
+# SuscCoral_brm <- brm(SuscCoral_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = SuscCoral_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Save model and/or read in saved model
+#saveRDS(SuscCoral_brm, "data/outputs/susceptibleCoral_brm.RDS")
+SuscCoral_brm <- readRDS("data/outputs/susceptibleCoral_brm.RDS")
+
+##### Look at model
+SuscCoral_brm 
+
+# posterior predictive checks
+pp_check(SuscCoral_brm, type = "hist", ndraws = 11) 
+pp_check(SuscCoral_brm, type = "boxplot", ndraws = 6)
+pp_check(SuscCoral_brm, type = "dens_overlay", ndraws = 100)
+
+y <- posterior_predict(SuscCoral_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_SuscCoral*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+## Sponge model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_SpoCov)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_SpoCov) #-we'll work with zero-inflated beta
+
+#define model
+sponge_mod <- bf(pctCov_SpoCov ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              zi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+              family =  zero_inflated_beta(link = "logit", link_phi = "log", link_zi = "logit"))
+
+##### Get priors
+get_prior(sponge_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_sponge <- BlackPointData %>%
+              filter(pctCov_SpoCov> 0)
+
+logit(mean(BPD_sponge$pctCov_SpoCov)) #-2.4
+
+##### Set priors
+sponge_prior <- c(prior(normal(-2.4, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+               prior(lkj(2), class = "cor"),
+               prior(logistic(0, 1), class = "Intercept", dpar = "zi"),
+               prior(normal(0, 1), class = "b", dpar = "zi"),
+               prior(exponential(1), class = "sd", dpar = "zi"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment to run model                    
+# sponge_brm <- brm(sponge_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = sponge_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Uncomment below to save model and/or read in saved model
+#saveRDS(sponge_brm, "data/outputs/sponge_brm.RDS")
+sponge_brm <- readRDS("data/outputs/sponge_brm.RDS")
+
+##### Look at model               
+sponge_brm 
+
+#posterior predictive checks
+pp_check(sponge_brm, type = "hist", ndraws = 11) 
+pp_check(sponge_brm, type = "boxplot", ndraws = 6)
+pp_check(sponge_brm, type = "dens_overlay", ndraws = 100) 
+
+y <- posterior_predict(sponge_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_SpoCov*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+
+## Turf algae model
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_EACCov)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_EACCov) #-we'll work with beta
+
+#define model
+turf_mod <- bf(pctCov_EACCov ~ 1  + yearsSinceInf + (1 + yearsSinceInf|Site), #-this last term allows the yearsSinceInf slope to vary across sites (also sites have varying intercepts)-#
+              phi ~ 1 + yearsSinceInf + (1 + yearsSinceInf|Site),
+                    family = Beta(link = "logit", link_phi = "log"))
+
+##### Get priors
+get_prior(turf_mod, data = tcrmp_meta_pctcov) 
+
+#####Calculate logit-mean of reference level for weakly-regularizing priors
+BPD_turf <- BlackPointData %>%
+              filter(pctCov_EACCov> 0)
+
+logit(mean(BPD_turf$pctCov_EACCov)) #-0.5
+
+##### Set priors
+turf_prior <- c(prior(normal(-0.5, 1), class = "Intercept"),
+               prior(normal(0, 1), class = "b"),
+               prior(lkj(2), class = "cor"),
+               prior(normal(0, 1), class = "Intercept", dpar = "phi"),
+               prior(normal(0, 1), class = "b", dpar = "phi"),
+               prior(normal(0, 1), class = "sd", dpar = "phi"),
+               prior(exponential(1), class = "sd"))
+
+##### Uncomment below to run model
+# turf_brm <- brm(turf_mod,
+#                data = tcrmp_meta_pctcov,
+#                prior = turf_prior,
+#                cores = n_cores,
+#                chains = n_chains,
+#                iter = n_iter,
+#                warmup = n_warmup,
+#                init = init_list)
+
+##### Save model and/or read in saved model
+#saveRDS(turf_brm, "data/outputs/turfAlgae_brm.RDS")
+turf_brm<- readRDS("data/outputs/turfAlgae_brm.RDS")
+
+##### Look at model
+turf_brm 
+
+#posterior predictive checks
+pp_check(turf_brm, type = "hist", ndraws = 11) 
+pp_check(turf_brm, type = "boxplot", ndraws = 6)
+pp_check(turf_brm, type = "dens_overlay", ndraws = 100)
+
+y <- posterior_predict(turf_brm)*100
+yrep_int <- sapply(data.frame(y), as.integer)
+y_int <- as.integer(tcrmp_meta_pctcov$pctCov_EACCov*100)
+ppc_bars(y_int, yrep_int)
+ppc_rootogram(y_int, yrep_int)
+```
+
+## Zoanthid model
+- omitted after conversation w/ T. Smith because he said they are extremely rare at the depths surveyed 
+
+```{r}
+#-Visualize changes across sites over time-#
+tcrmp_meta_pctcov %>%
+  ggplot(aes(x = yearsSinceInf, y = pctCov_ZoanCov)) +
+  geom_point(aes(colour = Site)) +
+  geom_smooth(method = "lm", se = F, aes(colour = Site)) +
+  theme(legend.position = "none") + 
+  theme_bw()
+
+#look at data distribution
+hist(tcrmp_meta_pctcov$pctCov_ZoanCov) #-we'll work with zero-inflated beta
+
+ggplot(tcrmp_meta_pctcov)+
+  geom_histogram(aes(x = pctCov_ZoanCov, fill = Site))+
+                   facet_wrap(~Year)
+```
+
+## setup for generating predictions
+
+```{r pred-frame}
+#-Since our only two predictors in the model are Site and yearsSinceInf, this will let us generate predictions for all sites over a given period-#
+SCTLD_sites <- unique(tcrmp_meta_pctcov$Site)
+t <- seq(0, 10, by = (1/52)) #since effect is in years, this will estimate change per week
+
+SCTLD_pred <- expand.grid(SCTLD_sites, t)
+
+colnames(SCTLD_pred) <- c("Site", "yearsSinceInf")
+```
+
+## Get R2 value for each model
+
+```{r}
+bayes_R2(cca_brm)#.50
+bayes_R2(cyano_brm)#.27
+bayes_R2(gorgo_brm)#.67
+bayes_R2(fireCoral_brm)#.24
+bayes_R2(macro_brm)#.74
+bayes_R2(resistantCoral_brm)#.48
+bayes_R2(SuscCoral_brm)#.80
+bayes_R2(sponge_brm)#.62
+bayes_R2(turf_brm)#.65
+```
+
+### get posterior effect estimates for plotting
+```{r}
+posterior_draws_cca <- cca_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "cca")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_susc <- SuscCoral_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "SCTLD-susceptible coral")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_sponge <- sponge_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "sponge")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_resistant <- resistantCoral_brm  %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "SCTLD-resistant coral")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_macroalg <- macro_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "macroalgae")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_turfalg <- turf_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "turf algae")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_gorgonian <- gorgo_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "gorgo")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_cyanobacteria <- cyano_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "cyanobacteria")%>%
+  relocate(effect, .before = effect_estimate)
+
+posterior_draws_fireCoral <- fireCoral_brm %>%
+ posterior_samples()%>%
+  select(b_yearsSinceInf)%>%
+  rename(effect_estimate = b_yearsSinceInf)%>%
+  mutate(effect = "fireCoral")%>%
+  relocate(effect, .before = effect_estimate)
+
+PD_all <- posterior_draws_cca %>%
+  full_join(posterior_draws_cyanobacteria)%>%
+  full_join(posterior_draws_gorgonian)%>%
+  full_join(posterior_draws_macroalg)%>%
+  full_join(posterior_draws_resistant)%>%
+  full_join(posterior_draws_sponge)%>%
+  full_join(posterior_draws_susc)%>%
+  full_join(posterior_draws_turfalg)%>%
+  full_join(posterior_draws_fireCoral)%>%
+  group_by(effect)%>%
+  mutate(meanEffect = mean(effect_estimate))
+```
+
+# # Fig 2A - plot of standardized effect size estimates
+
+```{r total-biomass-direct}
+(tcrmpPosteriorDraws <- PD_all %>%
+  ggplot(aes(x = effect_estimate, y = reorder(effect, -meanEffect))) +
+  stat_halfeye()+
+  geom_vline(xintercept = 0, size = 1, linetype = "dashed") +
+  theme_bw(base_size = 20) +
+  ylab("") +
+  coord_cartesian(xlim = c(-1, 1))+
+  xlab("Posterior estimate"))
+
+ggsave(file="fig/2a_tcrmpPosteriorDraws.svg", plot=tcrmpPosteriorDraws, width=10, height=10)
+```
+
+# Figure 2B - plot of susceptible and resistant coral predictions
+
+```{r}
+# FIGURE 2B
+sitesIslands <- tcrmp_meta_pctcov%>%
+  ungroup() %>%
+  select(Site, Island) %>%
+  unique()
+#########################################Resistant coral #########################################
+
+#-Predict changes to resistant at all sites over ten years-#
+resistantCoral_pred <- predict(resistantCoral_brm, newdata = SCTLD_pred) #-make predictions from our new df-#
+
+resistantCoral_pred <- bind_cols(SCTLD_pred, resistantCoral_pred) %>%
+  as_tibble()%>%
+  mutate(variable = "resistantCoral")%>%
+  full_join(sitesIslands, by = "Site")
+
+resistantCoral_site<-resistantCoral_pred%>%
+  select(-variable)%>%
+  group_by(Island, yearsSinceInf)%>%
+  summarise(Q2.5 = mean(Q2.5), 
+         Q97.5 = mean(Q97.5), 
+         Estimate = mean(Estimate))
+
+#-Plot predicted resistant cover with 95% confidence intervals and real data-#
+resistant10yrfig <- resistantCoral_site %>%
+  ggplot(aes(x = yearsSinceInf, fill = Island)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), alpha = 0.25) +
+  geom_line(aes(y = Estimate, colour = Island), size = 2) +
+  geom_point(data = tcrmp_meta_pctcov, aes(x = yearsSinceInf, y = pctCov_ResistantCoral, colour = Island)) +
+  theme_classic(base_size = 20) + 
+  ylim(0,0.25)+
+ # theme(legend.position = "none", strip.background = element_blank()) +
+  xlab("Years since infection") +
+  ylab("resistant coral percent cover")+
+  scale_fill_manual(values=c("#a1dab4", "#41b6c4", "#253494"))+
+  scale_color_manual(values=c("#a1dab4", "#41b6c4", "#253494"))
+resistant10yrfig
+ggsave(file="fig/2b_resistant_10YearFig_Island.svg", plot=resistant10yrfig, width=10, height=10)
+
+### MAKE RELATIVE DF FOR RESISTANT CORAL
+resistantCoral_rel <- resistantCoral_pred %>%
+  group_by(Site)%>%
+  mutate(t0_resistant = Estimate[yearsSinceInf==0])%>%
+  ungroup()%>%
+  mutate(resistant_Rel = Estimate/t0_resistant)
+
+# 5 year predicted mean change
+resistantCoral_rel%>%
+  filter(yearsSinceInf == 5)%>%
+  summarise(pctChange = mean(resistant_Rel))
+
+# 10 year predicted mean change
+resistantCoral_rel%>%
+  filter(yearsSinceInf == 10)%>%
+  summarise(pctChange = mean(resistant_Rel))
+
+#########################################Susceptible coral #########################################
+
+#-Predict changes to Susc at all sites over ten years-#
+SuscCoral_pred <- predict(SuscCoral_brm, newdata = SCTLD_pred) #-make predictions from our new df-#
+
+SuscCoral_pred <- bind_cols(SCTLD_pred, SuscCoral_pred) %>%
+  as_tibble()
+
+SuscCoral_pred<-SuscCoral_pred%>%
+  mutate(variable = "suscCoral")%>%
+  full_join(sitesIslands, by = "Site")
+
+suscCoral_site<-SuscCoral_pred%>%
+  select(-variable)%>%
+  group_by(Island, yearsSinceInf)%>%
+  summarise(Q2.5 = mean(Q2.5), 
+         Q97.5 = mean(Q97.5), 
+         Estimate = mean(Estimate))
+
+#-Plot predicted resistant cover with 95% confidence intervals and real data-#
+(susc10yrfig <- suscCoral_site %>%
+  ggplot(aes(x = yearsSinceInf, fill = Island)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), alpha = 0.25) +
+  geom_line(aes(y = Estimate, colour = Island), size = 2) +
+  geom_point(data = tcrmp_meta_pctcov, aes(x = yearsSinceInf, y = pctCov_SuscCoral, colour = Island)) +
+  theme_classic(base_size = 20) + 
+  ylim(0,0.25)+
+ # theme(legend.position = "none", strip.background = element_blank()) +
+  xlab("Years since infection") +
+  ylab("resistant coral percent cover")+
+  scale_fill_manual(values=c("#a1dab4", "#41b6c4", "#253494"))+
+  scale_color_manual(values=c("#a1dab4", "#41b6c4", "#253494")))
+
+ggsave(file="fig/2b_susc_10YearFig_Island.svg", plot=susc10yrfig, width=10, height=10)
+
+### MAKE RELATIVE DF FOR SUSC CORAL
+
+suscCoral_rel <- SuscCoral_pred %>%
+  group_by(Site)%>%
+  mutate(t0_susc = Estimate[yearsSinceInf==0])%>%
+  ungroup()%>%
+  mutate(susc_Rel = Estimate/t0_susc)
+
+# 5 year predicted mean change
+suscCoral_rel%>%
+  filter(yearsSinceInf == 5)%>%
+  summarise(pctChange = mean(susc_Rel))
+
+# 10 year predicted mean change
+suscCoral_rel%>%
+  filter(yearsSinceInf == 10)%>%
+  summarise(pctChange = mean(susc_Rel))
+
+```
